@@ -1825,13 +1825,32 @@ export class Function extends Component implements Link.Linkable {
       return Link.getInclude<Permission>("aws.permission", args.link);
     }
 
-    // Helper to find the parent directory of "src" in the handler path
+    /**
+     * Finds the root directory of a Python project by looking for standard Python project files.
+     * @param handlerPath - The path to the Lambda handler file
+     * @returns The path to the Python project root
+     * @throws {VisibleError} If the handler path is invalid
+     */
     function findPythonProjectRoot(handlerPath: string): string {
+      if (!handlerPath) {
+        throw new VisibleError("Handler path is required for Python functions");
+      }
+
       // Remove the .handler suffix if present
       const modulePath = handlerPath.replace(/\.handler$/, '');
       
       // Get the absolute path to the handler
       const handlerAbsPath = path.resolve(process.cwd(), modulePath);
+      
+      // Validate the path exists
+      try {
+        fs.accessSync(handlerAbsPath);
+      } catch (err) {
+        throw new VisibleError(
+          `Handler path "${handlerPath}" does not exist`
+        );
+      }
+
       let currentDir = path.dirname(handlerAbsPath);
       
       // Look for Python project files
@@ -1848,36 +1867,65 @@ export class Function extends Component implements Link.Linkable {
         currentDir = path.dirname(currentDir);
       }
       
-      // If no project file is found, return the handler's directory
-      return path.dirname(handlerAbsPath);
+      // If no project file is found, return workspace root with a warning
+      console.warn(
+        `Warning: No Python project files (pyproject.toml, setup.py, requirements.txt) found for handler "${handlerPath}". Using workspace root as project root.`
+      );
+      return process.cwd();
     }
 
-    // Helper to ensure Python package structure
+    /**
+     * Ensures proper Python package structure by creating __init__.py files.
+     * @param projectRoot - The root directory of the Python project
+     * @param handlerPath - The path to the Lambda handler file
+     * @throws {VisibleError} If there are filesystem permission issues
+     */
     async function ensurePythonPackageStructure(projectRoot: string, handlerPath: string) {
-      // Remove .handler suffix and get absolute paths
-      const modulePath = handlerPath.replace(/\.handler$/, '');
-      const handlerAbsPath = path.resolve(process.cwd(), modulePath);
-      
-      // Get the relative path from project root to handler
-      const relPath = path.relative(projectRoot, handlerAbsPath);
-      const parts = relPath.split(path.sep);
-      
-      // Create __init__.py files in each directory
-      let currentPath = projectRoot;
-      for (const part of parts) {
-        currentPath = path.join(currentPath, part);
-        if (fs.existsSync(currentPath) && fs.statSync(currentPath).isDirectory()) {
-          const initPath = path.join(currentPath, '__init__.py');
-          if (!fs.existsSync(initPath)) {
-            await fs.promises.writeFile(initPath, '', 'utf8');
+      try {
+        // Remove .handler suffix and get absolute paths
+        const modulePath = handlerPath.replace(/\.handler$/, '');
+        const handlerAbsPath = path.resolve(process.cwd(), modulePath);
+        
+        // Get the relative path from project root to handler
+        const relPath = path.relative(projectRoot, handlerAbsPath);
+        const parts = relPath.split(/[\\/]/);
+        
+        // Create __init__.py files in each directory
+        let currentPath = projectRoot;
+        for (const part of parts) {
+          currentPath = path.join(currentPath, part);
+          if (fs.existsSync(currentPath) && fs.statSync(currentPath).isDirectory()) {
+            const initPath = path.join(currentPath, '__init__.py');
+            if (!fs.existsSync(initPath)) {
+              try {
+                await fs.promises.writeFile(initPath, '', 'utf8');
+                console.debug(`Created __init__.py in ${currentPath}`);
+              } catch (err) {
+                throw new VisibleError(
+                  `Failed to create __init__.py in "${currentPath}". Ensure you have write permissions.`
+                );
+              }
+            }
           }
         }
-      }
 
-      // Create a root __init__.py if it doesn't exist
-      const rootInit = path.join(projectRoot, '__init__.py');
-      if (!fs.existsSync(rootInit)) {
-        await fs.promises.writeFile(rootInit, '', 'utf8');
+        // Create a root __init__.py if it doesn't exist
+        const rootInit = path.join(projectRoot, '__init__.py');
+        if (!fs.existsSync(rootInit)) {
+          try {
+            await fs.promises.writeFile(rootInit, '', 'utf8');
+            console.debug(`Created root __init__.py in ${projectRoot}`);
+          } catch (err) {
+            throw new VisibleError(
+              `Failed to create root __init__.py in "${projectRoot}". Ensure you have write permissions.`
+            );
+          }
+        }
+      } catch (err) {
+        if (err instanceof VisibleError) throw err;
+        throw new VisibleError(
+          `Failed to create Python package structure: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
 
@@ -1900,9 +1948,18 @@ export class Function extends Component implements Link.Linkable {
               await ensurePythonPackageStructure(bundleDir, handler);
               
               // Convert file path to Python module path
-              const relPath = path.relative(bundleDir, path.resolve(process.cwd(), handler.replace(/\.handler$/, '')));
-              const modulePath = relPath.split(path.sep).join('.');
+              const relPath = path.relative(
+                bundleDir,
+                path.resolve(process.cwd(), handler.replace(/\.handler$/, ''))
+              );
+              // Handle both Windows and POSIX paths
+              const modulePath = relPath.split(/[\\/]/).join('.');
               handler = modulePath + '.handler';
+
+              console.debug(`Python handler configured:
+                Project root: ${bundleDir}
+                Module path: ${modulePath}
+                Final handler: ${handler}`);
             } else {
               bundleDir = path.dirname(handler.split(".")[0]);
             }
@@ -1923,11 +1980,15 @@ export class Function extends Component implements Link.Linkable {
             }>("Runtime.Build", buildInput);
 
             if (!result || typeof result !== "object") {
-              throw new Error("Invalid response from Runtime.Build");
+              throw new VisibleError(
+                "Invalid response from Runtime.Build. Expected an object with handler, out, errors, and sourcemaps."
+              );
             }
 
             if (result.errors && result.errors.length > 0) {
-              throw new Error(result.errors.join("\n"));
+              throw new VisibleError(
+                `Build failed:\n${result.errors.join("\n")}`
+              );
             }
 
             if (args.hook?.postbuild) {
@@ -1939,9 +2000,11 @@ export class Function extends Component implements Link.Linkable {
               bundle: result.out || bundleDir,
               sourcemaps: result.sourcemaps || []
             };
-          } catch (error) {
-            console.error("Build error:", error);
-            throw error;
+          } catch (err) {
+            if (err instanceof VisibleError) throw err;
+            throw new VisibleError(
+              `Failed to build function: ${err instanceof Error ? err.message : String(err)}`
+            );
           }
         }
       );

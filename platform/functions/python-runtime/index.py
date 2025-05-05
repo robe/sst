@@ -1,3 +1,4 @@
+print("SST DEV PYTHON RUNTIME: custom build 2024-06-XX", flush=True)
 import importlib
 import json
 import os
@@ -5,6 +6,7 @@ import sys
 import traceback
 import time
 import requests
+import re
 
 
 # Error handling function to report errors back to the Lambda runtime API
@@ -33,29 +35,79 @@ def log(message):
     sys.stderr.flush()
 
 
+def find_project_root(start_path):
+    """Find the Python project root by looking for project files."""
+    current = os.path.abspath(start_path)
+    while current != os.path.dirname(current):  # Stop at root directory
+        if any(os.path.exists(os.path.join(current, f)) 
+               for f in ['pyproject.toml', 'setup.py', 'requirements.txt']):
+            return current
+        current = os.path.dirname(current)
+    return os.getcwd()  # Fallback to current directory
+
+
+def setup_python_path(handler_path):
+    """Set up Python path to handle nested package imports correctly."""
+    log(f"Setting up Python path for handler: {handler_path}")
+    
+    # Split handler path (e.g., "src.lambda_handlers.api.handler" or "src/lambda_handlers/api.handler")
+    if "." in handler_path:
+        module_path, function_name = handler_path.rsplit(".", 1)
+        # Convert dots to system path separator for finding the file
+        file_path = module_path.replace(".", os.path.sep)
+    else:
+        raise ValueError(f"Invalid handler format: {handler_path}")
+    
+    # Find the project root
+    project_root = find_project_root(os.getcwd())
+    log(f"Project root found at: {project_root}")
+    
+    # Add paths to sys.path in order of precedence
+    paths_to_add = [
+        project_root,  # Project root for package imports
+        os.path.dirname(project_root),  # Parent of project root
+        os.getcwd(),  # Current working directory
+    ]
+    
+    # Add unique paths in reverse order (most specific first)
+    for path in reversed(paths_to_add):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+            log(f"Added to Python path: {path}")
+    
+    return module_path, function_name
+
+
 # Parse the handler from command-line arguments
-handler = sys.argv[1]  # Expecting the format 'module.function'
+handler = sys.argv[1]  # Expecting the format 'module.function' or 'path/to/module.function'
 AWS_LAMBDA_RUNTIME_API = f"http://{os.environ['AWS_LAMBDA_RUNTIME_API']}/2018-06-01"
 
-# If the handler is given as a file path, split it to get the directory and module
-module_path, function_name = handler.rsplit(".", 1)
-module_dir = os.path.dirname(module_path)
-module_name = os.path.basename(module_path)
-
-# Add the directory containing the module to the system path
-sys.path.insert(0, module_dir)
+def parse_handler(handler_str):
+    """Parse the handler string into module path and function name."""
+    if "." not in handler_str:
+        raise ValueError("Handler must be in the form 'module.function'")
+    
+    # Convert any path separators to dots for Python importing
+    normalized_handler = handler_str.replace("/", ".").replace("\\", ".")
+    module_path, function_name = normalized_handler.rsplit(".", 1)
+    
+    log(f"Parsed handler - module: {module_path}, function: {function_name}")
+    return module_path, function_name
 
 try:
-    # Dynamically load the module from the file path
-    module = importlib.import_module(module_name)
-
-    # Get the function from the module
+    module_path, function_name = setup_python_path(handler)
+    log(f"Attempting to import {module_path}.{function_name}")
+    
+    module = importlib.import_module(module_path)
     handler_function = getattr(module, function_name)
+    
     if not callable(handler_function):
-        raise ImportError(
-            f"{function_name} is not a callable function in {module_name}"
-        )
+        raise ImportError(f"{function_name} is not a callable function in {module_path}")
+        
+    log(f"Successfully imported handler function")
 except Exception as ex:
+    log(f"Import error: {ex}")
+    log(f"Current sys.path: {sys.path}")
     report_error(ex)
     sys.exit(1)
 
