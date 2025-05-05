@@ -1553,6 +1553,7 @@ export class Function extends Component implements Link.Linkable {
 
     const linkData = buildLinkData();
     const linkPermissions = buildLinkPermissions();
+
     const { bundle, handler: handler0, sourcemaps } = buildHandler();
     const { handler, wrapper } = buildHandlerWrapper();
     const role = createRole();
@@ -1824,36 +1825,125 @@ export class Function extends Component implements Link.Linkable {
       return Link.getInclude<Permission>("aws.permission", args.link);
     }
 
+    // Helper to find the parent directory of "src" in the handler path
+    function findPythonProjectRoot(handlerPath: string): string {
+      // Remove the .handler suffix if present
+      const modulePath = handlerPath.replace(/\.handler$/, '');
+      
+      // Get the absolute path to the handler
+      const handlerAbsPath = path.resolve(process.cwd(), modulePath);
+      let currentDir = path.dirname(handlerAbsPath);
+      
+      // Look for Python project files
+      while (currentDir !== process.cwd() && currentDir !== path.parse(currentDir).root) {
+        const hasProjectFile = [
+          'pyproject.toml',
+          'setup.py',
+          'requirements.txt'
+        ].some(file => fs.existsSync(path.join(currentDir, file)));
+        
+        if (hasProjectFile) {
+          return currentDir;
+        }
+        currentDir = path.dirname(currentDir);
+      }
+      
+      // If no project file is found, return the handler's directory
+      return path.dirname(handlerAbsPath);
+    }
+
+    // Helper to ensure Python package structure
+    async function ensurePythonPackageStructure(projectRoot: string, handlerPath: string) {
+      // Remove .handler suffix and get absolute paths
+      const modulePath = handlerPath.replace(/\.handler$/, '');
+      const handlerAbsPath = path.resolve(process.cwd(), modulePath);
+      
+      // Get the relative path from project root to handler
+      const relPath = path.relative(projectRoot, handlerAbsPath);
+      const parts = relPath.split(path.sep);
+      
+      // Create __init__.py files in each directory
+      let currentPath = projectRoot;
+      for (const part of parts) {
+        currentPath = path.join(currentPath, part);
+        if (fs.existsSync(currentPath) && fs.statSync(currentPath).isDirectory()) {
+          const initPath = path.join(currentPath, '__init__.py');
+          if (!fs.existsSync(initPath)) {
+            await fs.promises.writeFile(initPath, '', 'utf8');
+          }
+        }
+      }
+
+      // Create a root __init__.py if it doesn't exist
+      const rootInit = path.join(projectRoot, '__init__.py');
+      if (!fs.existsSync(rootInit)) {
+        await fs.promises.writeFile(rootInit, '', 'utf8');
+      }
+    }
+
     function buildHandler() {
-      return all([runtime, dev, isContainer]).apply(
-        async ([runtime, dev, isContainer]) => {
+      return all([runtime, dev, isContainer, args.handler, args.bundle]).apply(
+        async ([runtime, dev, isContainer, handler, bundle]) => {
           if (dev) {
             return {
               handler: "bootstrap",
               bundle: path.join($cli.paths.platform, "dist", "bridge"),
+              sourcemaps: []
             };
           }
 
-          const buildResult = buildInput.apply(async (input) => {
+          let bundleDir = "";
+          try {
+            if (runtime.startsWith("python")) {
+              // For Python, we need to include the entire project structure
+              bundleDir = findPythonProjectRoot(handler);
+              await ensurePythonPackageStructure(bundleDir, handler);
+              
+              // Convert file path to Python module path
+              const relPath = path.relative(bundleDir, path.resolve(process.cwd(), handler.replace(/\.handler$/, '')));
+              const modulePath = relPath.split(path.sep).join('.');
+              handler = modulePath + '.handler';
+            } else {
+              bundleDir = path.dirname(handler.split(".")[0]);
+            }
+
+            const buildInput = {
+              functionID: name,
+              handler: handler,
+              bundle: bundle || bundleDir,
+              runtime: runtime,
+              isContainer: isContainer
+            };
+
             const result = await rpc.call<{
               handler: string;
               out: string;
               errors: string[];
               sourcemaps: string[];
-            }>("Runtime.Build", { ...input, isContainer });
-            if (result.errors.length > 0) {
+            }>("Runtime.Build", buildInput);
+
+            if (!result || typeof result !== "object") {
+              throw new Error("Invalid response from Runtime.Build");
+            }
+
+            if (result.errors && result.errors.length > 0) {
               throw new Error(result.errors.join("\n"));
             }
-            if (args.hook?.postbuild) await args.hook.postbuild(result.out);
-            return result;
-          });
 
-          return {
-            handler: buildResult.handler,
-            bundle: buildResult.out,
-            sourcemaps: buildResult.sourcemaps,
-          };
-        },
+            if (args.hook?.postbuild) {
+              await args.hook.postbuild(result.out);
+            }
+
+            return {
+              handler: result.handler || handler,
+              bundle: result.out || bundleDir,
+              sourcemaps: result.sourcemaps || []
+            };
+          } catch (error) {
+            console.error("Build error:", error);
+            throw error;
+          }
+        }
       );
     }
 
